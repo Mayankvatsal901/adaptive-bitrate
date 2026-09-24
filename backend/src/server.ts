@@ -3,304 +3,194 @@ import * as path from "path";
 import * as fs from "fs";
 
 const app = express();
-
 const PORT = 5000;
 
-const hlsPath = path.join(
-  process.cwd(),
-  "videos",
-  "hls"
-);
+const hlsPath = path.join(process.cwd(), "videos", "hls");
+
+app.use(express.json());
 
 /*
  * ------------------------------------------------
- * CORS
+ * CORS + NO CACHE
  * ------------------------------------------------
- *
- * Frontend:
- * http://localhost:5173
- *
- * Backend:
- * http://localhost:5000
- *
- * These are different origins, so allow the
- * frontend to request our API and HLS files.
  */
-app.use((_req, res, next) => {
-  res.header(
-    "Access-Control-Allow-Origin",
-    "http://localhost:5173"
-  );
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "http://localhost:5173");
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  res.header("Cache-Control", "no-store");
 
-  res.header(
-    "Access-Control-Allow-Methods",
-    "GET,OPTIONS"
-  );
-
-  res.header(
-    "Access-Control-Allow-Headers",
-    "Content-Type"
-  );
+  // Express 5 rejects the "*" route pattern, so answer preflight here.
+  if (req.method === "OPTIONS") {
+    res.sendStatus(204);
+    return;
+  }
 
   next();
 });
 
 /*
- * ------------------------------------------------
- * HLS STATIC FILES
- * ------------------------------------------------
+ * ================================================
+ * NETWORK SIMULATION
+ * ================================================
  *
- * This exposes:
+ * Instead of DevTools throttling, the SERVER limits how fast it
+ * sends segments. The frontend switches profiles with a button,
+ * so the demo works for anyone who clones the repo.
  *
- * /videos/hls/sample/master.m3u8
- *
- * /videos/hls/sample/360p/segment_000.ts
- *
- * etc.
+ * mbps = 0 means unlimited.
  */
-app.use(
-  "/videos/hls",
-  express.static(hlsPath)
-);
+let networkMbps = 0;
+let networkLatencyMs = 0;
+let networkLabel = "Unlimited";
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+app.get("/api/network", (_req, res) => {
+  res.json({ mbps: networkMbps, latencyMs: networkLatencyMs, label: networkLabel });
+});
+
+app.post("/api/network", (req, res) => {
+  const { mbps, latencyMs, label } = req.body ?? {};
+
+  networkMbps = Number(mbps) || 0;
+  networkLatencyMs = Number(latencyMs) || 0;
+  networkLabel = String(label ?? (networkMbps ? `${networkMbps} Mbps` : "Unlimited"));
+
+  console.log(`NETWORK -> ${networkLabel} (${networkMbps || "unlimited"} Mbps, ${networkLatencyMs} ms)`);
+  res.json({ mbps: networkMbps, latencyMs: networkLatencyMs, label: networkLabel });
+});
 
 /*
- * ------------------------------------------------
+ * Send a file at a limited speed: one slice every 100 ms.
+ *
+ *   bytes per slice = mbps × 1_000_000 / 8 / 10
+ */
+async function sendThrottled(res: express.Response, filePath: string): Promise<void> {
+  const stats = fs.statSync(filePath);
+  const TICK_MS = 100;
+  const bytesPerTick = Math.max(2048, Math.floor((networkMbps * 1_000_000) / 8 / (1000 / TICK_MS)));
+
+  res.setHeader("Content-Type", "video/mp2t");
+  res.setHeader("Content-Length", stats.size);
+
+  if (networkLatencyMs > 0) await sleep(networkLatencyMs);
+
+  const stream = fs.createReadStream(filePath, { highWaterMark: bytesPerTick });
+
+  let aborted = false;
+  res.on("close", () => {
+    aborted = true;
+    stream.destroy();
+  });
+
+  try {
+    for await (const chunk of stream) {
+      if (aborted) return;
+
+      if (!res.write(chunk)) {
+        await new Promise<void>((resolve) => res.once("drain", () => resolve()));
+      }
+      await sleep(TICK_MS);
+    }
+    if (!aborted) res.end();
+  } catch {
+    if (!aborted) res.end();
+  }
+}
+
+/*
+ * Segments go through the throttle; playlists are tiny, so they don't.
+ */
+app.get(/^\/videos\/hls\/.*\.ts$/, (req, res, next) => {
+  if (networkMbps <= 0) return next();
+
+  const filePath = path.join(hlsPath, decodeURIComponent(req.path.replace("/videos/hls/", "")));
+  if (!fs.existsSync(filePath)) return res.sendStatus(404);
+
+  void sendThrottled(res, filePath);
+});
+
+app.use("/videos/hls", express.static(hlsPath));
+
+/*
+ * ================================================
  * VIDEO QUALITIES
- * ------------------------------------------------
- *
- * The index MUST match the HLS level index.
- *
- * HLS:
- *
- * level 0 → 360p
- * level 1 → 480p
- * level 2 → 720p
- * level 3 → 1080p
+ * ================================================
  */
 const qualities = [
-  {
-    index: 0,
-    name: "360p",
-    directory: "360p",
-  },
-  {
-    index: 1,
-    name: "480p",
-    directory: "480p",
-  },
-  {
-    index: 2,
-    name: "720p",
-    directory: "720p",
-  },
-  {
-    index: 3,
-    name: "1080p",
-    directory: "1080p",
-  },
+  { index: 0, name: "144p", directory: "144p" },
+  { index: 1, name: "360p", directory: "360p" },
+  { index: 2, name: "480p", directory: "480p" },
+  { index: 3, name: "720p", directory: "720p" },
+  { index: 4, name: "1080p", directory: "1080p" },
 ];
 
-/*
- * ------------------------------------------------
- * READ SEGMENT DURATIONS
- * ------------------------------------------------
- *
- * Reads the corresponding playlist.m3u8.
- *
- * Example:
- *
- * #EXTINF:8.000,
- * segment_000.ts
- *
- * We extract:
- *
- * duration = 8 seconds
- */
-function getSegmentDurations(
-  directoryPath: string
-): number[] {
-  const playlistPath = path.join(
-    directoryPath,
-    "playlist.m3u8"
-  );
+function getSegmentDurations(directoryPath: string): number[] {
+  const playlistPath = path.join(directoryPath, "playlist.m3u8");
+  if (!fs.existsSync(playlistPath)) return [];
 
-  if (!fs.existsSync(playlistPath)) {
-    return [];
-  }
-
-  const playlist = fs.readFileSync(
-    playlistPath,
-    "utf-8"
-  );
-
+  const playlist = fs.readFileSync(playlistPath, "utf-8");
   const durations: number[] = [];
 
-  const lines = playlist
-    .split(/\r?\n/)
-    .map((line) => line.trim());
-
-  for (const line of lines) {
+  for (const line of playlist.split(/\r?\n/).map((l) => l.trim())) {
     if (line.startsWith("#EXTINF:")) {
-      const durationText = line
-        .replace("#EXTINF:", "")
-        .split(",")[0];
-
-      const duration = Number(
-        durationText
-      );
-
-      if (!Number.isNaN(duration)) {
-        durations.push(duration);
-      }
+      const duration = Number(line.replace("#EXTINF:", "").split(",")[0]);
+      if (!Number.isNaN(duration)) durations.push(duration);
     }
   }
-
   return durations;
 }
 
 /*
- * ------------------------------------------------
+ * ================================================
  * SEGMENT METADATA API
- * ------------------------------------------------
- *
- * GET:
- *
- * /api/videos/sample/segments
- *
- * Returns:
- *
- * - quality
- * - HLS level index
- * - segment number
- * - actual file size
- * - segment duration
+ * ================================================
  */
-app.get(
-  "/api/videos/sample/segments",
-  (_req, res) => {
-    try {
-      const result = qualities.map(
-        (quality) => {
-          const directoryPath =
-            path.join(
-              hlsPath,
-              "sample",
-              quality.directory
-            );
+app.get("/api/videos/sample/segments", (_req, res) => {
+  try {
+    const result = qualities.map((quality) => {
+      const directoryPath = path.join(hlsPath, "sample", quality.directory);
 
-          /*
-           * Check quality directory.
-           */
-          if (
-            !fs.existsSync(
-              directoryPath
-            )
-          ) {
-            return {
-              index: quality.index,
-              name: quality.name,
-              segments: [],
-            };
-          }
+      if (!fs.existsSync(directoryPath)) {
+        console.warn(`MISSING QUALITY DIRECTORY: ${directoryPath}`);
+        return { index: quality.index, name: quality.name, segments: [] };
+      }
 
-          /*
-           * Get all TS files.
-           */
-          const files = fs
-            .readdirSync(directoryPath)
-            .filter((file) =>
-              /^segment_\d+\.ts$/.test(
-                file
-              )
-            )
-            .sort();
+      const files = fs
+        .readdirSync(directoryPath)
+        .filter((file) => /^segment_\d+\.ts$/.test(file))
+        .sort();
 
-          /*
-           * Get durations from playlist.
-           */
-          const durations =
-            getSegmentDurations(
-              directoryPath
-            );
+      const durations = getSegmentDurations(directoryPath);
 
-          const segments =
-            files.map(
-              (file, fileIndex) => {
-                const filePath =
-                  path.join(
-                    directoryPath,
-                    file
-                  );
+      const segments = files.map((file, fileIndex) => {
+        const stats = fs.statSync(path.join(directoryPath, file));
+        const match = file.match(/segment_(\d+)\.ts/);
+        const segmentNumber = match ? Number(match[1]) : fileIndex;
 
-                const stats =
-                  fs.statSync(filePath);
-
-                /*
-                 * Extract actual segment
-                 * number from filename.
-                 *
-                 * segment_009.ts
-                 *        ↓
-                 *       9
-                 */
-                const match =
-                  file.match(
-                    /segment_(\d+)\.ts/
-                  );
-
-                const segmentNumber =
-                  match
-                    ? Number(match[1])
-                    : fileIndex;
-
-                return {
-                  segment:
-                    segmentNumber,
-
-                  sizeBytes:
-                    stats.size,
-
-                  duration:
-                    durations[
-                      fileIndex
-                    ] ?? 0,
-                };
-              }
-            );
-
-          return {
-            index: quality.index,
-            name: quality.name,
-            segments,
-          };
-        }
-      );
-
-      res.json({
-        video: "sample",
-        qualities: result,
+        return {
+          segment: segmentNumber,
+          sizeBytes: stats.size,
+          duration: durations[fileIndex] ?? 0,
+        };
       });
-    } catch (error) {
-      console.error(
-        "SEGMENT METADATA ERROR:",
-        error
-      );
 
-      res.status(500).json({
-        error:
-          "Failed to generate segment metadata",
-      });
-    }
+      return { index: quality.index, name: quality.name, segments };
+    });
+
+    console.log(
+      "SEGMENT METADATA:",
+      result.map((q) => `${q.name}=${q.segments.length}`).join(" ")
+    );
+
+    res.json({ video: "sample", qualities: result });
+  } catch (error) {
+    console.error("SEGMENT METADATA ERROR:", error);
+    res.status(500).json({ error: "Failed to generate segment metadata" });
   }
-);
+});
 
-/*
- * ------------------------------------------------
- * SERVER
- * ------------------------------------------------
- */
 app.listen(PORT, () => {
-  console.log(
-    `Server running on http://localhost:${PORT}`
-  );
+  console.log(`Server running on http://localhost:${PORT}`);
 });

@@ -1,50 +1,76 @@
 /*
- * Dual EMA bandwidth estimator (same idea Hls.js uses).
+ * Duration-weighted EWMA bandwidth estimator
+ * (the same maths Hls.js uses internally).
  *
- * fast EMA reacts quickly, slow EMA is stable.
- * We return the MINIMUM of both:
- *   - network drops  -> fast EMA falls quickly -> we react quickly
- *   - network rises  -> slow EMA rises slowly  -> we upgrade carefully
+ * Why weighted?
+ *
+ * A simple average treats every sample equally, so one 21-second
+ * slow download counts the same as a 0.2-second fast one. That is
+ * why the estimate stayed at 50 Mbps even after a download that
+ * clearly measured 1.4 Mbps.
+ *
+ * Here the WEIGHT of a sample is how long the download took, so a
+ * long slow download almost completely replaces the old estimate.
  */
+class Ewma {
+  private readonly alpha: number;
+  private estimate = 0;
+  private totalWeight = 0;
+
+  constructor(halfLifeSeconds: number) {
+    // alpha^halfLife = 0.5
+    this.alpha = Math.exp(Math.log(0.5) / halfLifeSeconds);
+  }
+
+  sample(weightSeconds: number, value: number): void {
+    const adjustedAlpha = Math.pow(this.alpha, weightSeconds);
+    this.estimate = value * (1 - adjustedAlpha) + adjustedAlpha * this.estimate;
+    this.totalWeight += weightSeconds;
+  }
+
+  getEstimate(): number {
+    if (this.totalWeight === 0) return 0;
+    // Remove the bias of starting from zero.
+    const zeroFactor = 1 - Math.pow(this.alpha, this.totalWeight);
+    return this.estimate / zeroFactor;
+  }
+
+  hasSample(): boolean {
+    return this.totalWeight > 0;
+  }
+}
+
 export class BandwidthEstimator {
-  private fast: number | null = null;
-  private slow: number | null = null;
+  // Fast: reacts within a couple of seconds of download time.
+  private fast = new Ewma(2);
+  // Slow: stable, prevents jumping up too eagerly.
+  private slow = new Ewma(8);
 
-  private readonly fastAlpha = 0.5;
-  private readonly slowAlpha = 0.15;
-
-  // Ignore tiny downloads: request latency dominates them.
-  private readonly minBytes = 16_000;
-
-  // Localhost / browser cache can give ~0 ms downloads (1000+ Mbps).
-  // Cap each sample so one fake sample can't explode the estimate.
+  // Localhost / cache can report ~0 ms downloads (1000+ Mbps).
   private readonly maxSampleMbps = 100;
 
+  /*
+   * Feed one measurement. Can also be called with PARTIAL data
+   * while a segment is still downloading (see the abort logic).
+   */
   update(bytesLoaded: number, downloadTimeMs: number): number {
-    if (bytesLoaded < this.minBytes || downloadTimeMs <= 0) {
-      return this.getEstimate();
-    }
+    if (bytesLoaded <= 0 || downloadTimeMs <= 0) return this.getEstimate();
 
+    const seconds = downloadTimeMs / 1000;
     const sampleMbps = Math.min(
-      (bytesLoaded * 8) / (downloadTimeMs / 1000) / 1_000_000,
+      (bytesLoaded * 8) / seconds / 1_000_000,
       this.maxSampleMbps
     );
 
-    this.fast =
-      this.fast === null
-        ? sampleMbps
-        : this.fastAlpha * sampleMbps + (1 - this.fastAlpha) * this.fast;
-
-    this.slow =
-      this.slow === null
-        ? sampleMbps
-        : this.slowAlpha * sampleMbps + (1 - this.slowAlpha) * this.slow;
+    this.fast.sample(seconds, sampleMbps);
+    this.slow.sample(seconds, sampleMbps);
 
     return this.getEstimate();
   }
 
   getEstimate(): number {
-    if (this.fast === null || this.slow === null) return 0;
-    return Math.min(this.fast, this.slow);
+    if (!this.fast.hasSample()) return 0;
+    // Lowest of the two = the careful choice.
+    return Math.min(this.fast.getEstimate(), this.slow.getEstimate());
   }
 }
